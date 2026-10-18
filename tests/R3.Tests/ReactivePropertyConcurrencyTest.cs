@@ -5,6 +5,87 @@ namespace R3.Tests;
 public class ReactivePropertyConcurrencyTest
 {
     [Fact]
+    public async Task AtomicUpdatesDoNotLoseConcurrentIncrements()
+    {
+        using var property = new ReactiveProperty<int>(0);
+        var values = new ConcurrentQueue<int>();
+        using var subscription = property.Subscribe(values.Enqueue);
+
+        await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => Task.Run(() =>
+        {
+            for (var i = 0; i < 1000; i++)
+            {
+                property.Update(value =>
+                {
+                    Thread.SpinWait(100);
+                    return value + 1;
+                });
+            }
+        }))).WaitAsync(TimeSpan.FromSeconds(20));
+
+        property.CurrentValue.ShouldBe(4000);
+        values.ToArray().ShouldBe(Enumerable.Range(0, 4001));
+    }
+
+    [Fact]
+    public void AtomicUpdatePreservesComparerAndDoesNotPublishAFailedTransformation()
+    {
+        using var property = new ReactiveProperty<string>("initial", StringComparer.OrdinalIgnoreCase);
+        var values = new List<string>();
+        using var subscription = property.Subscribe(values.Add);
+
+        property.Update(_ => "INITIAL").ShouldBe("initial");
+        property.Update(_ => "changed").ShouldBe("changed");
+        Should.Throw<InvalidOperationException>(() =>
+            property.Update(_ => throw new InvalidOperationException("test")));
+
+        property.CurrentValue.ShouldBe("changed");
+        values.ShouldBe(["initial", "changed"]);
+    }
+
+    [Fact]
+    public async Task AtomicTogglesPreserveEveryTransition()
+    {
+        using var property = new ReactiveProperty<bool>(false);
+        var values = new ConcurrentQueue<bool>();
+        using var subscription = property.Subscribe(values.Enqueue);
+
+        await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => Task.Run(() =>
+        {
+            for (var i = 0; i < 1001; i++)
+            {
+                property.Update(value =>
+                {
+                    Thread.SpinWait(100);
+                    return !value;
+                });
+            }
+        }))).WaitAsync(TimeSpan.FromSeconds(20));
+
+        property.CurrentValue.ShouldBeFalse();
+        values.ToArray().ShouldBe(Enumerable.Range(0, 4005).Select(i => i % 2 != 0));
+    }
+
+    [Fact]
+    public void AtomicUpdateRejectsNullAndDisposedWithoutInvokingTheTransformation()
+    {
+        var property = new ReactiveProperty<int>(7);
+        Should.Throw<ArgumentNullException>(() => property.Update(null!));
+        property.CurrentValue.ShouldBe(7);
+        property.Dispose();
+        var invoked = false;
+
+        Should.Throw<ObjectDisposedException>(() => property.Update(value =>
+        {
+            invoked = true;
+            return value + 1;
+        }));
+
+        invoked.ShouldBeFalse();
+        property.CurrentValue.ShouldBe(7);
+    }
+
+    [Fact]
     public async Task ConcurrentWritersSerializeNotifications()
     {
         using var property = new ReactiveProperty<int>(0, null);

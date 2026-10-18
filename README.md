@@ -27,8 +27,11 @@ Important boundaries:
 - Bindable validation configuration and UI binding still belong to the UI thread.
 - Subscribers must not synchronously wait for another thread that needs the same property.
   Cyclic writes between properties require consistent lock ordering.
-- Compound operations (`Value++`), updates across properties and mutations of reference-type values
-  need caller synchronization.
+- Use `property.Update(value => value + 1)` for atomic read/modify/write operations. It runs the
+  transformation and normal setter/comparer under the same property monitor. Do not mutate the
+  property from the transformation or block waiting for another writer.
+- The C# `Value++` expression still calls the getter and setter separately; use `Update` instead.
+  Updates across properties and mutations of reference-type values need caller synchronization.
 - The protected `GetValueRef` API bypasses synchronization. Derived callers must provide exclusion.
 - Other subjects and operators retain their upstream concurrency requirements.
 - Calls after disposal retain R3's `ObjectDisposedException` behavior. Stop producers before tearing

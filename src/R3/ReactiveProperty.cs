@@ -114,6 +114,21 @@ public class ReactiveProperty<T> : ReadOnlyReactiveProperty<T>, ISubject<T>
     protected virtual void OnValueChanging(ref T value) { }
     protected ref T GetValueRef() => ref currentValue.Value; // dangerous: ref writes bypass synchronization
 
+    /// <summary>
+    /// Atomically reads, transforms and assigns the value using the normal setter and comparer.
+    /// The transformation runs under the notification monitor and must not block on another writer.
+    /// </summary>
+    public T Update(Func<T, T> update)
+    {
+        ArgumentNullException.ThrowIfNull(update);
+        lock (this)
+        {
+            ThrowIfDisposed();
+            Value = update(CurrentValue);
+            return CurrentValue;
+        }
+    }
+
     public virtual void ForceNotify()
     {
         lock (this)
