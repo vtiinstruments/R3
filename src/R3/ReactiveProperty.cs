@@ -27,11 +27,17 @@ public class ReactiveProperty<T> : ReadOnlyReactiveProperty<T>, ISubject<T>
     const byte CompletedFailure = 2;
     const byte Disposed = 3;
 
-    // Memory Size: 1(byte) + 8(IntPtr) + sizeof(T) + 8(IntPtr) and subscriptions(nodes).
     byte completeState;
     Exception? error;
-    T currentValue;
+    ValueSnapshot currentValue = new(default!);
     IEqualityComparer<T>? equalityComparer; // allow null for no-compare
+
+    // Publish whole values without taking the notification lock on readers. A locking getter would
+    // invert locks in consumers that read a property while holding their own state lock.
+    sealed class ValueSnapshot(T value)
+    {
+        public T Value = value;
+    }
 
     // For reduce memory usage, ReactiveProperty<T> itself is LinkedList and subscription represents LinkedListNode.
     // The last of node is root.Previous(if null, single list).
@@ -39,32 +45,35 @@ public class ReactiveProperty<T> : ReadOnlyReactiveProperty<T>, ISubject<T>
 
     public IEqualityComparer<T>? EqualityComparer => equalityComparer;
 
-    public override T CurrentValue => currentValue;
+    public override T CurrentValue => Volatile.Read(ref currentValue).Value;
 
-    public bool HasObservers => root != null;
-    public bool IsCompleted => completeState == CompletedSuccess || completeState == CompletedFailure;
-    public bool IsDisposed => completeState == Disposed;
+    public bool HasObservers => Volatile.Read(ref root) != null;
+    public bool IsCompleted => Volatile.Read(ref completeState) is CompletedSuccess or CompletedFailure;
+    public bool IsDisposed => Volatile.Read(ref completeState) == Disposed;
     public bool IsCompletedOrDisposed => IsCompleted || IsDisposed;
 
     public virtual T Value
     {
-        get => this.currentValue;
+        get => CurrentValue;
         set
         {
-            OnValueChanging(ref value);
-
-            if (EqualityComparer != null)
+            lock (this)
             {
-                if (EqualityComparer.Equals(this.currentValue, value))
+                OnValueChanging(ref value);
+
+                if (EqualityComparer != null)
                 {
-                    return;
+                    if (EqualityComparer.Equals(CurrentValue, value))
+                    {
+                        return;
+                    }
                 }
+
+                Volatile.Write(ref currentValue, new ValueSnapshot(value));
+                OnValueChanged(value);
+
+                OnNextCore(value);
             }
-
-            this.currentValue = value;
-            OnValueChanged(value);
-
-            OnNextCore(value);
         }
     }
 
@@ -81,7 +90,7 @@ public class ReactiveProperty<T> : ReadOnlyReactiveProperty<T>, ISubject<T>
     {
         this.equalityComparer = equalityComparer;
         OnValueChanging(ref value);
-        this.currentValue = value;
+        this.currentValue = new ValueSnapshot(value);
         OnValueChanged(value);
     }
 
@@ -94,7 +103,7 @@ public class ReactiveProperty<T> : ReadOnlyReactiveProperty<T>, ISubject<T>
             OnValueChanging(ref value);
         }
 
-        this.currentValue = value;
+        this.currentValue = new ValueSnapshot(value);
 
         if (callOnValueChangeInBaseConstructor)
         {
@@ -103,67 +112,79 @@ public class ReactiveProperty<T> : ReadOnlyReactiveProperty<T>, ISubject<T>
     }
 
     protected virtual void OnValueChanging(ref T value) { }
-    protected ref T GetValueRef() => ref currentValue; // dangerous
+    protected ref T GetValueRef() => ref currentValue.Value; // dangerous: ref writes bypass synchronization
 
     public virtual void ForceNotify()
     {
-        OnNext(Value);
+        lock (this)
+        {
+            OnNext(Value);
+        }
     }
 
     public virtual void OnNext(T value)
     {
-        OnValueChanging(ref value);
-        this.currentValue = value; // different from Subject<T>; set value before raise OnNext
-        OnValueChanged(value);  // for inheritance types.
+        lock (this)
+        {
+            OnValueChanging(ref value);
+            Volatile.Write(ref currentValue, new ValueSnapshot(value));
+            OnValueChanged(value);
 
-        OnNextCore(value);
+            OnNextCore(value);
+        }
     }
 
     protected virtual void OnNextCore(T value)
     {
-        ThrowIfDisposed();
-        if (IsCompleted) return;
-
-        var node = root;
-        var last = node?.Previous;
-        while (node != null)
+        lock (this)
         {
-            node.Observer.OnNext(value);
-            if (node == last) return;
-            node = node.Next;
+            ThrowIfDisposed();
+            if (IsCompleted) return;
+
+            var node = root;
+            var last = node?.Previous;
+            while (node != null)
+            {
+                node.Observer.OnNext(value);
+                if (node == last) return;
+                node = node.Next;
+            }
         }
     }
 
     public void OnErrorResume(Exception error)
     {
-        ThrowIfDisposed();
-        if (IsCompleted) return;
-
-        OnReceiveError(error);
-
-        var node = Volatile.Read(ref root);
-        var last = node?.Previous;
-        while (node != null)
+        lock (this)
         {
-            node.Observer.OnErrorResume(error);
-            if (node == last) return;
-            node = node.Next;
+            ThrowIfDisposed();
+            if (IsCompleted) return;
+
+            OnReceiveError(error);
+
+            var node = root;
+            var last = node?.Previous;
+            while (node != null)
+            {
+                node.Observer.OnErrorResume(error);
+                if (node == last) return;
+                node = node.Next;
+            }
         }
     }
 
     public void OnCompleted(Result result)
     {
-        ThrowIfDisposed();
-        if (IsCompleted) return;
-
-        ObserverNode? node = null;
-        lock (this) // I know lock(this) is dangerous.
+        lock (this)
         {
+            ThrowIfDisposed();
+            if (IsCompleted) return;
+
+            ObserverNode? node = null;
             if (completeState == NotCompleted)
             {
-                completeState = result.IsSuccess ? CompletedSuccess : CompletedFailure;
+                Volatile.Write(ref completeState, result.IsSuccess ? CompletedSuccess : CompletedFailure);
                 error = result.Exception;
-                node = Volatile.Read(ref root);
+                node = root;
                 Volatile.Write(ref root, null); // when complete, List is clear.
             }
             else
@@ -172,77 +193,49 @@ public class ReactiveProperty<T> : ReadOnlyReactiveProperty<T>, ISubject<T>
                 ThrowIfDisposed();
                 return;
             }
-        }
+            if (result.IsFailure)
+            {
+                OnReceiveError(result.Exception);
+            }
 
-        if (result.IsFailure)
-        {
-            OnReceiveError(result.Exception);
-        }
-
-        var last = node?.Previous;
-        while (node != null)
-        {
-            node.Observer.OnCompleted(result);
-            if (node == last) return;
-            node = node.Next;
+            var last = node?.Previous;
+            while (node != null)
+            {
+                node.Observer.OnCompleted(result);
+                if (node == last) return;
+                node = node.Next;
+            }
         }
     }
 
     protected override IDisposable SubscribeCore(Observer<T> observer)
     {
-        Result? completedResult;
         lock (this)
         {
             ThrowIfDisposed();
             if (IsCompleted)
             {
-                completedResult = (error == null) ? Result.Success : Result.Failure(error);
+                var result = (error == null) ? Result.Success : Result.Failure(error);
+                if (result.IsSuccess)
+                {
+                    observer.OnNext(CurrentValue);
+                }
+                observer.OnCompleted(result);
+                return Disposable.Empty;
             }
-            else
-            {
-                completedResult = null;
-            }
-        }
 
-        if (completedResult != null)
-        {
-            goto PUBLISH_CURRENT_AND_RESULT;
-        }
+            // Replay and registration share the writer lock so no update can be lost between them.
+            observer.OnNext(CurrentValue);
 
-        // raise latest value on subscribe(before add observer to list)
-        observer.OnNext(currentValue);
-
-        lock (this)
-        {
             ThrowIfDisposed();
             if (IsCompleted)
             {
-                completedResult = (error == null) ? Result.Success : Result.Failure(error);
-                goto PUBLISH_RESULT;
+                observer.OnCompleted((error == null) ? Result.Success : Result.Failure(error));
+                return Disposable.Empty;
             }
 
-            // create subscription and add to list in lock.
-            var subscription = new ObserverNode(this, observer);
-            return subscription;
+            return new ObserverNode(this, observer);
         }
-
-    PUBLISH_CURRENT_AND_RESULT:
-        if (completedResult != null)
-        {
-            if (completedResult.Value.IsSuccess)
-            {
-                observer.OnNext(currentValue);
-            }
-            observer.OnCompleted(completedResult.Value);
-            return Disposable.Empty;
-        }
-
-    PUBLISH_RESULT:
-        if (completedResult != null)
-        {
-            observer.OnCompleted(completedResult.Value);
-        }
-        return Disposable.Empty;
     }
 
     void ThrowIfDisposed()
@@ -257,9 +250,9 @@ public class ReactiveProperty<T> : ReadOnlyReactiveProperty<T>, ISubject<T>
 
     public void Dispose(bool callOnCompleted)
     {
-        ObserverNode? node = null;
         lock (this)
         {
+            ObserverNode? node = null;
             if (completeState == Disposed)
             {
                 return;
@@ -272,15 +265,15 @@ public class ReactiveProperty<T> : ReadOnlyReactiveProperty<T>, ISubject<T>
             }
 
             Volatile.Write(ref root, null);
-            completeState = Disposed;
-        }
+            Volatile.Write(ref completeState, Disposed);
 
-        while (node != null)
-        {
-            node.Observer.OnCompleted();
-            node = node.Next;
-        }
+            while (node != null)
+            {
+                node.Observer.OnCompleted();
+                node = node.Next;
+            }
 
+        }
         DisposeCore();
     }
 
@@ -288,7 +281,8 @@ public class ReactiveProperty<T> : ReadOnlyReactiveProperty<T>, ISubject<T>
 
     public override string? ToString()
     {
-        return (currentValue == null) ? "(null)" : currentValue.ToString();
+        var value = CurrentValue;
+        return (value == null) ? "(null)" : value.ToString();
     }
 
     // debugging property
@@ -299,14 +293,17 @@ public class ReactiveProperty<T> : ReadOnlyReactiveProperty<T>, ISubject<T>
     {
         get
         {
-            var count = 0;
-            var node = root;
-            while (node != null)
+            lock (this)
             {
-                count++;
-                node = node.Next;
+                var count = 0;
+                var node = root;
+                while (node != null)
+                {
+                    count++;
+                    node = node.Next;
+                }
+                return count;
             }
-            return count;
         }
     }
 
@@ -314,14 +311,17 @@ public class ReactiveProperty<T> : ReadOnlyReactiveProperty<T>, ISubject<T>
     {
         get
         {
-            var list = new List<ObserverNode>();
-            var node = root;
-            while (node != null)
+            lock (this)
             {
-                list.Add(node);
-                node = node.Next;
+                var list = new List<ObserverNode>();
+                var node = root;
+                while (node != null)
+                {
+                    list.Add(node);
+                    node = node.Next;
+                }
+                return list.ToArray();
             }
-            return list.ToArray();
         }
     }
 
